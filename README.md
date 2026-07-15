@@ -2,6 +2,8 @@
 
 a fast, multithreaded rust app for importing video/audio files from multiple sd cards or drives at once.
 
+written with Gemini-3.1 Pro using Antigravity.
+
 ![UI Screenshot](./UI_Screenshot.png)
 
 ## features
