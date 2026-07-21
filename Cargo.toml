@@ -11,3 +11,7 @@ walkdir = "2.5"
 chrono = { version = "0.4", features = ["serde"] }
 egui_extras = { version = "0.27", features = ["datepicker"] }
 fs2 = "0.4"
+image = { version = "0.24", default-features = false, features = ["png", "jpeg"] }
+
+[build-dependencies]
+winres = "0.1"
