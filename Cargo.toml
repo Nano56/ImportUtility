@@ -1,6 +1,6 @@
 [package]
 name = "import_utility"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
@@ -15,3 +15,6 @@ image = { version = "0.24", default-features = false, features = ["png", "jpeg"]
 
 [build-dependencies]
 winres = "0.1"
+
+[dev-dependencies]
+tempfile = "3.10"

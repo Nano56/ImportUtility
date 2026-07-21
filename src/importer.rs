@@ -39,6 +39,65 @@ pub struct ScanMessage {
     pub results: Vec<ScanResult>,
 }
 
+pub fn should_include_file(
+    path: &std::path::Path,
+    metadata: &fs::Metadata,
+    extensions: &[String],
+    start_date: Option<chrono::NaiveDate>,
+    end_date: Option<chrono::NaiveDate>,
+) -> (bool, String) {
+    if !path.is_file() {
+        return (false, "Unknown".to_string());
+    }
+    
+    let ext = match path.extension().and_then(|s| s.to_str()) {
+        Some(e) => e,
+        None => return (false, "Unknown".to_string()),
+    };
+
+    if !extensions.iter().any(|e| e.eq_ignore_ascii_case(ext)) {
+        return (false, "Unknown".to_string());
+    }
+
+    let mut include = true;
+    let mut date_str = "Unknown".to_string();
+
+    if let Ok(modified) = metadata.modified() {
+        use chrono::{DateTime, Local};
+        let dt: DateTime<Local> = modified.into();
+        let date = dt.naive_local().date();
+        date_str = date.to_string();
+        
+        if let Some(start) = start_date {
+            if date < start { include = false; }
+        }
+        if let Some(end) = end_date {
+            if date > end { include = false; }
+        }
+    } else if start_date.is_some() || end_date.is_some() {
+        include = false;
+    }
+
+    (include, date_str)
+}
+
+pub fn resolve_path_conflict(mut dest_path: PathBuf, file_path: &std::path::Path, final_dest: &std::path::Path) -> PathBuf {
+    let base = file_path.file_stem().unwrap().to_string_lossy();
+    let ext = file_path.extension().unwrap_or_default().to_string_lossy();
+    let mut counter = 1;
+    while dest_path.exists() {
+        let new_name = if ext.is_empty() {
+            format!("{}_{}", base, counter)
+        } else {
+            format!("{}_{}.{}", base, counter, ext)
+        };
+        dest_path = final_dest.join(new_name);
+        counter += 1;
+    }
+    dest_path
+}
+
+
 pub fn start_import(
     source_index: usize,
     source_path: PathBuf,
@@ -72,34 +131,11 @@ pub fn start_import(
                 return;
             }
             let path = entry.path();
-            if path.is_file() {
-                if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-                    if extensions.iter().any(|e| e.eq_ignore_ascii_case(ext)) {
-                        if let Ok(metadata) = fs::metadata(path) {
-                            let mut include = true;
-                            
-                            // Check date bounds if provided
-                            if start_date.is_some() || end_date.is_some() {
-                                if let Ok(modified) = metadata.modified() {
-                                    use chrono::{DateTime, Local};
-                                    let dt: DateTime<Local> = modified.into();
-                                    let date = dt.naive_local().date();
-                                    
-                                    if let Some(start) = start_date {
-                                        if date < start { include = false; }
-                                    }
-                                    if let Some(end) = end_date {
-                                        if date > end { include = false; }
-                                    }
-                                }
-                            }
-                            
-                            if include {
-                                files_to_copy.push(path.to_path_buf());
-                                total_size += metadata.len();
-                            }
-                        }
-                    }
+            if let Ok(metadata) = fs::metadata(path) {
+                let (include, _) = should_include_file(path, &metadata, &extensions, start_date, end_date);
+                if include {
+                    files_to_copy.push(path.to_path_buf());
+                    total_size += metadata.len();
                 }
             }
         }
@@ -200,18 +236,7 @@ pub fn start_import(
                         continue;
                     }
                     ConflictResolution::Rename => {
-                        let base = file_path.file_stem().unwrap().to_string_lossy();
-                        let ext = file_path.extension().unwrap_or_default().to_string_lossy();
-                        let mut counter = 1;
-                        while dest_path.exists() {
-                            let new_name = if ext.is_empty() {
-                                format!("{}_{}", base, counter)
-                            } else {
-                                format!("{}_{}.{}", base, counter, ext)
-                            };
-                            dest_path = final_dest.join(new_name);
-                            counter += 1;
-                        }
+                        dest_path = resolve_path_conflict(dest_path, &file_path, &final_dest);
                     }
                     ConflictResolution::Overwrite => {} // Default behavior
                 }
@@ -317,34 +342,14 @@ pub fn start_scan(
                 return;
             }
             let path = entry.path();
-            if path.is_file() {
-                if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-                    if extensions.iter().any(|e| e.eq_ignore_ascii_case(ext)) {
-                        if let Ok(metadata) = fs::metadata(path) {
-                            let mut include = true;
-                            let mut date_str = "Unknown".to_string();
-                            
-                            if let Ok(modified) = metadata.modified() {
-                                use chrono::{DateTime, Local};
-                                let dt: DateTime<Local> = modified.into();
-                                let date = dt.naive_local().date();
-                                date_str = date.to_string();
-                                
-                                if let Some(start) = start_date {
-                                    if date < start { include = false; }
-                                }
-                                if let Some(end) = end_date {
-                                    if date > end { include = false; }
-                                }
-                            }
-                            
-                            if include {
-                                let key = (date_str, ext.to_lowercase());
-                                let entry = stats.entry(key).or_insert((0, 0));
-                                entry.0 += 1;
-                                entry.1 += metadata.len();
-                            }
-                        }
+            if let Ok(metadata) = fs::metadata(path) {
+                let (include, date_str) = should_include_file(path, &metadata, &extensions, start_date, end_date);
+                if include {
+                    if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+                        let key = (date_str, ext.to_lowercase());
+                        let entry = stats.entry(key).or_insert((0, 0));
+                        entry.0 += 1;
+                        entry.1 += metadata.len();
                     }
                 }
             }
@@ -377,4 +382,136 @@ pub fn start_scan(
             results,
         });
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::File;
+    use std::sync::mpsc;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_resolve_path_conflict() {
+        let dir = tempdir().unwrap();
+        let final_dest = dir.path().to_path_buf();
+        
+        let file_path = final_dest.join("test.mp4");
+        File::create(&file_path).unwrap(); // create dummy
+
+        // Simulate conflict
+        let conflict_path = final_dest.join("test.mp4");
+        
+        // Target file exists
+        let new_path = resolve_path_conflict(conflict_path, &file_path, &final_dest);
+        assert_eq!(new_path.file_name().unwrap(), "test_1.mp4");
+        
+        // If test_1.mp4 also exists
+        File::create(final_dest.join("test_1.mp4")).unwrap();
+        let conflict_path = final_dest.join("test.mp4");
+        let new_path2 = resolve_path_conflict(conflict_path, &file_path, &final_dest);
+        assert_eq!(new_path2.file_name().unwrap(), "test_2.mp4");
+    }
+
+    #[test]
+    fn test_should_include_file() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("video.mp4");
+        File::create(&file_path).unwrap();
+        let metadata = fs::metadata(&file_path).unwrap();
+        
+        let extensions = vec!["mp4".to_string(), "mov".to_string()];
+        
+        let (include, _) = should_include_file(&file_path, &metadata, &extensions, None, None);
+        assert!(include);
+        
+        let extensions_bad = vec!["txt".to_string()];
+        let (include_bad, _) = should_include_file(&file_path, &metadata, &extensions_bad, None, None);
+        assert!(!include_bad);
+    }
+    
+    #[test]
+    fn test_start_scan_integration() {
+        let dir = tempdir().unwrap();
+        let source_path = dir.path().to_path_buf();
+        
+        File::create(source_path.join("vid1.mp4")).unwrap();
+        File::create(source_path.join("vid2.mp4")).unwrap();
+        File::create(source_path.join("audio.wav")).unwrap(); // Should be ignored
+        
+        let (tx, rx) = mpsc::channel();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        
+        start_scan(
+            source_path,
+            "CamA".to_string(),
+            vec!["mp4".to_string()],
+            None,
+            None,
+            tx,
+            cancel_flag
+        );
+        
+        let mut final_results = Vec::new();
+        while let Ok(msg) = rx.recv() {
+            if msg.is_done {
+                final_results = msg.results;
+                break;
+            }
+        }
+        
+        assert_eq!(final_results.len(), 1); // Only 1 date/extension combination (today, mp4)
+        assert_eq!(final_results[0].extension, "mp4");
+        assert_eq!(final_results[0].count, 2);
+    }
+
+    #[test]
+    fn test_start_import_integration() {
+        let dir = tempdir().unwrap();
+        let source_path = dir.path().join("source");
+        let dest_base = dir.path().join("dest");
+        fs::create_dir_all(&source_path).unwrap();
+        fs::create_dir_all(&dest_base).unwrap();
+
+        // Create some dummy files to copy
+        let dummy_data = b"hello world";
+        let mut f1 = File::create(source_path.join("vid1.mp4")).unwrap();
+        f1.write_all(dummy_data).unwrap();
+        let mut f2 = File::create(source_path.join("vid2.mp4")).unwrap();
+        f2.write_all(dummy_data).unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+
+        start_import(
+            0,
+            source_path,
+            dest_base.clone(),
+            "MyProject".to_string(),
+            "CamA".to_string(),
+            vec!["mp4".to_string()],
+            None,
+            None,
+            ConflictResolution::Overwrite,
+            tx,
+            cancel_flag,
+        );
+
+        // Wait for the import to finish
+        while let Ok(msg) = rx.recv() {
+            if msg.done {
+                break;
+            }
+        }
+
+        // Verify that the files were copied to the correct structure
+        let final_dest = dest_base.join("MyProject").join("CamA");
+        assert!(final_dest.exists(), "Destination folder was not created");
+        assert!(final_dest.join("vid1.mp4").exists(), "vid1.mp4 was not copied");
+        assert!(final_dest.join("vid2.mp4").exists(), "vid2.mp4 was not copied");
+
+        // Verify content
+        let copied_content = fs::read(final_dest.join("vid1.mp4")).unwrap();
+        assert_eq!(copied_content, dummy_data);
+    }
 }
