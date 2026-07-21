@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
-use crate::importer::{self, ConflictResolution, ProgressMessage};
+use crate::importer::{self, ConflictResolution, ProgressMessage, ScanMessage, ScanResult};
 
 #[derive(Clone)]
 struct SourceProgress {
@@ -84,14 +84,22 @@ pub struct ImportUtilityApp {
     is_importing: bool,
     progress_states: Vec<SourceProgress>,
     
+    is_scanning: bool,
+    scan_results: Vec<ScanResult>,
+    scan_status: String,
+    active_scans: usize,
+    
     tx: Sender<ProgressMessage>,
     rx: Receiver<ProgressMessage>,
+    scan_tx: Sender<ScanMessage>,
+    scan_rx: Receiver<ScanMessage>,
     cancel_flag: Arc<AtomicBool>,
 }
 
 impl ImportUtilityApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let (tx, rx) = channel();
+        let (scan_tx, scan_rx) = channel();
         let mut app = Self {
             sources: Vec::new(),
             destination: None,
@@ -106,8 +114,14 @@ impl ImportUtilityApp {
             end_date: chrono::Local::now().date_naive(),
             is_importing: false,
             progress_states: Vec::new(),
+            is_scanning: false,
+            scan_results: Vec::new(),
+            scan_status: String::new(),
+            active_scans: 0,
             tx,
             rx,
+            scan_tx,
+            scan_rx,
             cancel_flag: Arc::new(AtomicBool::new(false)),
         };
 
@@ -126,6 +140,39 @@ impl ImportUtilityApp {
         }
         
         app
+    }
+
+    fn start_scan(&mut self) {
+        if self.sources.is_empty() {
+            return;
+        }
+
+        self.is_scanning = true;
+        self.scan_results.clear();
+        self.scan_status = "Starting scan...".to_string();
+        self.active_scans = self.sources.len();
+        self.cancel_flag.store(false, Ordering::SeqCst);
+
+        let start_date = if self.filter_start_date { Some(self.start_date) } else { None };
+        let end_date = if self.filter_end_date { Some(self.end_date) } else { None };
+        
+        let exts: Vec<String> = self.extensions_input
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        for (_, (source, camera_label)) in self.sources.iter().enumerate() {
+            importer::start_scan(
+                source.clone(),
+                camera_label.clone(),
+                exts.clone(),
+                start_date.clone(),
+                end_date.clone(),
+                self.scan_tx.clone(),
+                self.cancel_flag.clone(),
+            );
+        }
     }
 
     fn start_import(&mut self) {
@@ -216,10 +263,27 @@ impl eframe::App for ImportUtilityApp {
             }
         }
 
+        if self.is_scanning {
+            while let Ok(msg) = self.scan_rx.try_recv() {
+                if msg.is_done {
+                    self.active_scans = self.active_scans.saturating_sub(1);
+                    self.scan_results.extend(msg.results);
+                } else {
+                    self.scan_status = msg.status;
+                }
+            }
+            ctx.request_repaint();
+
+            if self.active_scans == 0 {
+                self.is_scanning = false;
+                self.scan_status = "Scan complete.".to_string();
+            }
+        }
+
         let is_importing = self.is_importing;
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Video/Audio Import Utility");
+            ui.heading(format!("Video/Audio Import Utility v{}", env!("CARGO_PKG_VERSION")));
             ui.add_space(10.0);
 
             ui.group(|ui| {
@@ -232,10 +296,10 @@ impl eframe::App for ImportUtilityApp {
                             ui.label(source.to_string_lossy().to_string());
                             ui.label("Folder Name:");
                             ui.add_enabled(
-                                !is_importing,
+                                !is_importing && !self.is_scanning,
                                 egui::TextEdit::singleline(label).desired_width(100.0),
                             );
-                            if ui.button("Remove").clicked() && !is_importing {
+                            if ui.button("Remove").clicked() && !is_importing && !self.is_scanning {
                                 to_remove = Some(i);
                             }
                         });
@@ -249,10 +313,10 @@ impl eframe::App for ImportUtilityApp {
                 ui.horizontal(|ui| {
                     ui.label("Path:");
                     ui.add_enabled(
-                        !self.is_importing,
+                        !self.is_importing && !self.is_scanning,
                         egui::TextEdit::singleline(&mut self.new_source_input),
                     );
-                    if ui.button("Add").clicked() && !self.is_importing && !self.new_source_input.trim().is_empty() {
+                    if ui.button("Add").clicked() && !self.is_importing && !self.is_scanning && !self.new_source_input.trim().is_empty() {
                         let path = PathBuf::from(self.new_source_input.trim());
                         if !self.sources.iter().any(|(p, _)| p == &path) {
                             let default_label = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
@@ -261,7 +325,7 @@ impl eframe::App for ImportUtilityApp {
                         self.new_source_input.clear();
                     }
                     ui.label("OR");
-                    if ui.button("Browse...").clicked() && !self.is_importing {
+                    if ui.button("Browse...").clicked() && !self.is_importing && !self.is_scanning {
                         if let Some(folder) = FileDialog::new().pick_folder() {
                             if !self.sources.iter().any(|(p, _)| p == &folder) {
                                 let default_label = folder.file_name().unwrap_or_default().to_string_lossy().into_owned();
@@ -280,10 +344,10 @@ impl eframe::App for ImportUtilityApp {
                 ui.horizontal(|ui| {
                     ui.label("Base Folder:");
                     ui.add_enabled(
-                        !self.is_importing,
+                        !self.is_importing && !self.is_scanning,
                         egui::TextEdit::singleline(&mut self.dest_input),
                     );
-                    if ui.button("Browse...").clicked() && !self.is_importing {
+                    if ui.button("Browse...").clicked() && !self.is_importing && !self.is_scanning {
                         if let Some(folder) = FileDialog::new().pick_folder() {
                             self.dest_input = folder.to_string_lossy().to_string();
                             self.destination = Some(folder);
@@ -296,7 +360,7 @@ impl eframe::App for ImportUtilityApp {
                 ui.horizontal(|ui| {
                     ui.label("Label / Project Name:");
                     ui.add_enabled(
-                        !self.is_importing,
+                        !self.is_importing && !self.is_scanning,
                         egui::TextEdit::singleline(&mut self.project_label).hint_text("e.g. Day_1_Shoot"),
                     );
                 });
@@ -320,7 +384,7 @@ impl eframe::App for ImportUtilityApp {
                 ui.horizontal(|ui| {
                     ui.label("File Extensions:");
                     ui.add_enabled(
-                        !self.is_importing,
+                        !self.is_importing && !self.is_scanning,
                         egui::TextEdit::singleline(&mut self.extensions_input).desired_width(200.0),
                     );
                 });
@@ -331,7 +395,7 @@ impl eframe::App for ImportUtilityApp {
                     ui.checkbox(&mut self.filter_start_date, "Start Date");
                     if self.filter_start_date {
                         ui.add_enabled(
-                            !self.is_importing,
+                            !self.is_importing && !self.is_scanning,
                             DatePickerButton::new(&mut self.start_date).id_source("start_date_picker"),
                         );
                     }
@@ -341,7 +405,7 @@ impl eframe::App for ImportUtilityApp {
                     ui.checkbox(&mut self.filter_end_date, "End Date");
                     if self.filter_end_date {
                         ui.add_enabled(
-                            !self.is_importing,
+                            !self.is_importing && !self.is_scanning,
                             DatePickerButton::new(&mut self.end_date).id_source("end_date_picker"),
                         );
                     }
@@ -358,23 +422,60 @@ impl eframe::App for ImportUtilityApp {
             };
             self.destination = dest_path;
 
-            let ready_to_start = !self.sources.is_empty() 
+            let ready_to_scan = !self.sources.is_empty();
+            let ready_to_start = ready_to_scan 
                 && self.destination.is_some() 
                 && !self.project_label.trim().is_empty();
 
-            if self.is_importing {
-                if ui.button("Cancel Import").clicked() {
-                    self.cancel_flag.store(true, Ordering::SeqCst);
-                }
-            } else {
-                ui.add_enabled_ui(ready_to_start, |ui| {
-                    if ui.button("Start Import").clicked() {
-                        self.start_import();
+            ui.horizontal(|ui| {
+                if self.is_importing || self.is_scanning {
+                    if ui.button("Cancel").clicked() {
+                        self.cancel_flag.store(true, Ordering::SeqCst);
                     }
-                });
-            }
+                } else {
+                    ui.add_enabled_ui(ready_to_scan, |ui| {
+                        if ui.button("Scan / Analyze").clicked() {
+                            self.start_scan();
+                        }
+                    });
+                    
+                    ui.add_enabled_ui(ready_to_start, |ui| {
+                        if ui.button("Start Import").clicked() {
+                            self.start_import();
+                        }
+                    });
+                }
+            });
 
             ui.add_space(15.0);
+
+            if self.is_scanning || !self.scan_results.is_empty() {
+                ui.label(egui::RichText::new("Scan Results").strong());
+                if self.is_scanning {
+                    ui.label(&self.scan_status);
+                } else {
+                    egui::ScrollArea::vertical().id_source("scan_scroll").max_height(200.0).show(ui, |ui| {
+                        egui::Grid::new("scan_results_grid").striped(true).show(ui, |ui| {
+                            ui.label(egui::RichText::new("Camera").strong());
+                            ui.label(egui::RichText::new("Date").strong());
+                            ui.label(egui::RichText::new("File Type").strong());
+                            ui.label(egui::RichText::new("Count").strong());
+                            ui.label(egui::RichText::new("Total Size").strong());
+                            ui.end_row();
+                            
+                            for res in &self.scan_results {
+                                ui.label(&res.camera_label);
+                                ui.label(&res.date);
+                                ui.label(&res.extension);
+                                ui.label(res.count.to_string());
+                                ui.label(format_size(res.total_size));
+                                ui.end_row();
+                            }
+                        });
+                    });
+                }
+                ui.add_space(15.0);
+            }
 
             if !self.progress_states.is_empty() {
                 ui.label(egui::RichText::new("Progress").strong());

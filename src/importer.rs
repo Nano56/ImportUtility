@@ -4,6 +4,7 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use walkdir::WalkDir;
 use std::io::{Read, Write};
+use std::collections::HashMap;
 
 #[derive(Clone, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum ConflictResolution {
@@ -21,6 +22,21 @@ pub struct ProgressMessage {
     pub total_size_bytes: u64,
     pub copied_size_bytes: u64,
     pub done: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScanResult {
+    pub camera_label: String,
+    pub date: String,
+    pub extension: String,
+    pub count: usize,
+    pub total_size: u64,
+}
+
+pub struct ScanMessage {
+    pub is_done: bool,
+    pub status: String,
+    pub results: Vec<ScanResult>,
 }
 
 pub fn start_import(
@@ -273,6 +289,92 @@ pub fn start_import(
             total_size_bytes: total_size,
             copied_size_bytes: copied_size,
             done: true,
+        });
+    });
+}
+
+pub fn start_scan(
+    source_path: PathBuf,
+    camera_label: String,
+    extensions: Vec<String>,
+    start_date: Option<chrono::NaiveDate>,
+    end_date: Option<chrono::NaiveDate>,
+    tx: Sender<ScanMessage>,
+    cancel_flag: Arc<AtomicBool>,
+) {
+    std::thread::spawn(move || {
+        let _ = tx.send(ScanMessage {
+            is_done: false,
+            status: "Scanning...".to_string(),
+            results: vec![],
+        });
+
+        // Key: (Date String, Extension)
+        let mut stats: HashMap<(String, String), (usize, u64)> = HashMap::new();
+
+        for entry in WalkDir::new(&source_path).into_iter().filter_map(|e| e.ok()) {
+            if cancel_flag.load(Ordering::SeqCst) {
+                return;
+            }
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+                    if extensions.iter().any(|e| e.eq_ignore_ascii_case(ext)) {
+                        if let Ok(metadata) = fs::metadata(path) {
+                            let mut include = true;
+                            let mut date_str = "Unknown".to_string();
+                            
+                            if let Ok(modified) = metadata.modified() {
+                                use chrono::{DateTime, Local};
+                                let dt: DateTime<Local> = modified.into();
+                                let date = dt.naive_local().date();
+                                date_str = date.to_string();
+                                
+                                if let Some(start) = start_date {
+                                    if date < start { include = false; }
+                                }
+                                if let Some(end) = end_date {
+                                    if date > end { include = false; }
+                                }
+                            }
+                            
+                            if include {
+                                let key = (date_str, ext.to_lowercase());
+                                let entry = stats.entry(key).or_insert((0, 0));
+                                entry.0 += 1;
+                                entry.1 += metadata.len();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut results = Vec::new();
+        for ((date, ext), (count, size)) in stats {
+            results.push(ScanResult {
+                camera_label: camera_label.clone(),
+                date,
+                extension: ext,
+                count,
+                total_size: size,
+            });
+        }
+        
+        // Sort results by date then extension
+        results.sort_by(|a, b| {
+            let cmp = a.date.cmp(&b.date);
+            if cmp == std::cmp::Ordering::Equal {
+                a.extension.cmp(&b.extension)
+            } else {
+                cmp
+            }
+        });
+
+        let _ = tx.send(ScanMessage {
+            is_done: true,
+            status: "Done".to_string(),
+            results,
         });
     });
 }
